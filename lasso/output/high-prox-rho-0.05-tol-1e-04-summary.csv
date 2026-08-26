@@ -1,0 +1,5 @@
+method,meanTime,stdTime,meanMVP,stdMVP,meanOuterIterations,meanProxResidual,successRate
+PSSgb-CG,NaN,NaN,NaN,NaN,2,0.830668821454374,0
+PSSgb-L-BFGS,NaN,NaN,NaN,NaN,2,0.631799359468786,0
+TMAP-CG,NaN,NaN,NaN,NaN,3,0.365776384303627,0
+TMAP-L-BFGS,NaN,NaN,NaN,NaN,3,0.60538274089373,0

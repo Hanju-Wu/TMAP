@@ -1,0 +1,47 @@
+FAST-BCDA: Fast Active Set Block Coordinate Descent Algorithm 
+================================================================
+
+FAST-BCDA is the algorithm presented in the paper:
+
+"A Fast Active Set Block Coordinate Descent Algorithm 
+for l1-regularized least squares" by M. De Santis, S. Lucidi, F. Rinaldi
+SIAM Journal on Optimization, 26(1), pp. 781-809, (2016)
+
+
+FAST-BCDA deals with problems of the form:
+
+  min 0.5||Ax-b||_2^2 + tau*||x||_1,
+
+where A is an mxn matrix, b is a n-dimensional vector and 
+tau is a positive scalar (regularization parameter). 
+
+-----------------------------------------------------------------
+
+This folder contains the following Matlab files:
+
+- FAST_BCDA.m: an implementation of FAST_BCDA.
+               Several choices can be taken by the user.
+               The required inputs are A,b,and tau.
+
+- Call_FAST_1CDA.m, Call_FAST_1CDA_acc.m 
+  Call_FAST_2CDA.m and Call_FAST_2CDA_acc.m:
+               these are matlab scripts that set the parameters
+               needed to run the basic and the enhanced 
+               versions of FAST-BCDA, as detailed in the paper,
+
+
+- Example.m: an example for calling FAST-BCDA in its four versions provided.
+
+                     A testing instance is generated:
+                     an artificial signal of dimension n = 2^14, 
+                     with a number of observations m=n/4 is generated.
+                     The number of nonzeros in the solution is set to 
+                     T= round(rho*m), where rho = 0.01.
+                     Matrix A is built using the MATLAB function "sprand" 
+
+
+
+
+Enjoy!! :)
+
+Marianna, Francesco and Stefano

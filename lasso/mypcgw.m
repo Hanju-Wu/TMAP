@@ -1,4 +1,4 @@
-function [x,it,info,r,p,Ax,rnm] = mypcgw(A,b,rtol,maxit,precf,Axreturned)
+function [x,it,info,r,p,Ax,rnm] = mypcgw(A,b,rtol,maxit,precf,Axreturned,sig,tau,ind,N)
 %[x,it,info,r,p,Ax] = mypcg(A,b,rtol,maxit,precf,Axreturned)
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 % MYPCG, v1
@@ -29,6 +29,7 @@ if nargin < 6
     Axreturned  = false;
 end
 
+B = A(:,~ind);
 x       = 0*b;
 Ax      = 0;
 r       = b;
@@ -59,9 +60,11 @@ rho     = r'*z;
 for it = 1:maxit
 
     if Axreturned
-        [q,Mp]  = feval(A,p);
+        Bp = B*p;
+        Mp        = A'*(Bp);
+        q           = B'*Bp + (sig/tau)*p;
     else
-        q       = feval(A,p);
+        q       = B'*(B*p) + (sig/tau)*p;
     end
     
     ptq         = p'*q;
