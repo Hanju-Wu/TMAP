@@ -9,6 +9,7 @@ if ~isfield(opts,'tol');   opts.tol = 1e-6;     end
 if ~isfield(opts,'maxit'); opts.maxit = 100; end
 if ~isfield(opts,'inner_solver'); opts.inner_solver = 'cg'; end
 if ~isfield(opts,'lbfgs_mem'); opts.lbfgs_mem = 20; end
+if ~isfield(opts,'lbfgs_curvature_tol'); opts.lbfgs_curvature_tol = 1e-8; end
 if ~isfield(opts,'cont');     opts.cont = 1;   end
 if ~isfield(opts,'cont_max'); opts.cont_max = 10;   end
 if ~isfield(opts,'crit'); opts.crit = 1;   end
@@ -29,6 +30,10 @@ useLBFGS = strcmpi(opts.inner_solver,'lbfgs');
 if ~isscalar(opts.lbfgs_mem) || opts.lbfgs_mem < 1 || ...
         opts.lbfgs_mem ~= floor(opts.lbfgs_mem)
     error('opts.lbfgs_mem must be a positive integer.');
+end
+if ~isscalar(opts.lbfgs_curvature_tol) || ...
+        ~isfinite(opts.lbfgs_curvature_tol) || opts.lbfgs_curvature_tol <= 0
+    error('opts.lbfgs_curvature_tol must be a finite positive scalar.');
 end
 if useLBFGS
     if ~isfield(opts,'lbfgs_descent_fraction')
@@ -193,7 +198,8 @@ for iter = 1:maxit
     x = xz; res = resxz; grad = gradxz; epsilonk = min(epsilon, res);
     if useLBFGS
         [S,Y,Hdiag] = updateLBFGSHistory( ...
-            S,Y,Hdiag,x-xp,grad-gradp,opts.lbfgs_mem);
+            S,Y,Hdiag,x-xp,grad-gradp,opts.lbfgs_mem, ...
+            opts.lbfgs_curvature_tol);
     end
     funcx = funcxz;
     out.fvec(iter + 1) = targetObjective(x,Ax);
@@ -321,14 +327,19 @@ out.Acalls = out.mvp_total;
         
     end
 
-    function [S,Y,Hdiag] = updateLBFGSHistory(S,Y,Hdiag,s,y,maxPairs)
+    function [S,Y,Hdiag] = updateLBFGSHistory( ...
+            S,Y,Hdiag,s,y,maxPairs,curvatureTol)
         ys = y'*s;
         yy = y'*y;
         if any(~isfinite(s)) || any(~isfinite(y)) || ...
                 ~isfinite(ys) || ~isfinite(yy)
             return;
         end
-        if ys > 1e-10 && yy > 0
+        % Use a relative curvature test so small, well-aligned steps near
+        % convergence are not rejected merely because |s' * y| is tiny.
+        curvatureScale = max(norm(s)*norm(y),realmin);
+        curvatureOK = ys > curvatureTol*curvatureScale && yy > 0;
+        if curvatureOK
             Hdiag = ys/yy;
         end
         if numel(S) >= maxPairs
@@ -345,7 +356,9 @@ out.Acalls = out.mvp_total;
         for j = 1:numel(S)
             sj = S{j}(mask);
             yj = Y{j}(mask);
-            if isfinite(yj'*sj) && yj'*sj > 1e-10
+            curvatureScale = max(norm(sj)*norm(yj),realmin);
+            if isfinite(yj'*sj) && ...
+                    yj'*sj > opts.lbfgs_curvature_tol*curvatureScale
                 nPairs = nPairs + 1;
                 valid(nPairs) = j;
             end
