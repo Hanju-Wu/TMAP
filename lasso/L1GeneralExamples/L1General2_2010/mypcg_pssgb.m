@@ -1,7 +1,9 @@
-function [x,it,info,r,rnm] = mypcg_pssgb(Afun,b,rtol,maxit,precf,sig)
+function [x,it,info,r,rnm] = mypcg_pssgb(Afun,b,rtol,maxit,precf,sig,shouldStop)
 %MYPCG_PSSGB Truncated PCG for (H + sig*I)x = b.
 % Afun applies H to a vector. The stopping test matches the one used by
 % TMAP: ||r|| <= rtol*min(||b||,sig*||x||).
+% Optional shouldStop callback returns true on timeout (info = 6).
+if nargin < 7; shouldStop = []; end
 
 if nargin < 5 || isempty(precf)
     precavail = false;
@@ -40,7 +42,12 @@ if ~isfinite(rho) || rho <= 0
     return;
 end
 
-for it = 1:maxit
+for cgStep = 1:maxit
+    if ~isempty(shouldStop) && shouldStop()
+        info = 6;
+        return;
+    end
+    it = cgStep;
     q = Afun(p) + sig*p;
     ptq = p'*q;
     if ~isfinite(ptq) || ptq <= 0

@@ -1,6 +1,9 @@
 function [x, out] = lr_newtonacc(x0, A, b, mu, opts)
+% opts.maxTime (seconds, default Inf) cooperatively stops at the last recorded iterate.
 
 if ~isfield(opts, 'maxit'); opts.maxit = 10000; end
+if ~isfield(opts, 'maxTime'); opts.maxTime = Inf; end
+validateattributes(opts.maxTime,{'numeric'},{'real','scalar','nonnegative','nonnan'});
 if ~isfield(opts, 'ftol'); opts.ftol = 1e-8; end
 if ~isfield(opts, 'gtol'); opts.gtol = 1e-6; end
 if ~isfield(opts, 'f_ref'); opts.f_ref = []; end
@@ -12,6 +15,8 @@ if ~isfield(opts, 'bb'); opts.bb = 0; end
 if ~isfield(opts, 'opt_dim'); opts.opt_dim = 0; end
 
 out = struct();
+out.maxTime = opts.maxTime;
+out.timedOut = false;
 [m,n] = size(A);
 k = 0;
 x = x0;
@@ -19,6 +24,10 @@ t = opts.alpha0;
 fp = inf;
 
 tt = tic;
+shouldStop = [];
+if isfinite(opts.maxTime)
+    shouldStop = @() toc(tt) >= opts.maxTime;
+end
 mvp = 2; % initial A*x and A'*gradient products
 
 Ax = A*x;
@@ -41,6 +50,11 @@ Cval = tmpf; Q = 1; gamma = 0.85; rhols = 1e-6; m1 = 0.1; rate = 1;
 
 while k < opts.maxit && ((isempty(opts.f_ref) && res > opts.gtol) || ...
         (~isempty(opts.f_ref) && out.gap(end) > opts.gap_tol))
+    if ~isempty(shouldStop) && shouldStop()
+        x = y;
+        out.timedOut = true;
+        break;
+    end
     
     fp = f;
     xp = y;
@@ -50,6 +64,10 @@ while k < opts.maxit && ((isempty(opts.f_ref) && res > opts.gtol) || ...
     if opts.ls
         nls = 0;
         while 1
+            if ~isempty(shouldStop) && shouldStop()
+                out.timedOut = true;
+                break;
+            end
             Ax = A*x;
             mvp = mvp + 1;
             expba = exp(- b.*Ax);
@@ -60,6 +78,10 @@ while k < opts.maxit && ((isempty(opts.f_ref) && res > opts.gtol) || ...
             
             t = 0.2*t; nls = nls + 1;
             x = prox(xp - t * g, t * mu);
+        end
+        if out.timedOut
+            x = xp; f = fp;
+            break;
         end
         
         f = tmpf;
@@ -84,8 +106,13 @@ while k < opts.maxit && ((isempty(opts.f_ref) && res > opts.gtol) || ...
     Dx = p.*(1-p)/m;
     Aminus = A(:,manifold_index);
     eta = zeros(n,1);
-    [eta(manifold_index),~,cg_mvp] = conjgrad(Aminus, Dx, -r_grad(manifold_index), zeros(sum(manifold_index),1), rate);
+    [eta(manifold_index),~,cg_mvp] = conjgrad(Aminus, Dx, -r_grad(manifold_index), zeros(sum(manifold_index),1), rate,shouldStop);
     mvp = mvp + cg_mvp;
+    if ~isempty(shouldStop) && shouldStop()
+        x = xp; f = fp;
+        out.timedOut = true;
+        break;
+    end
 
     alpha = 1;
     linesearch = eta'*r_grad;
@@ -97,6 +124,10 @@ while k < opts.maxit && ((isempty(opts.f_ref) && res > opts.gtol) || ...
     y = x + alpha*eta;
     nls = 0;
     while 1
+        if ~isempty(shouldStop) && shouldStop()
+            out.timedOut = true;
+            break;
+        end
         Ay = Ax + alpha*Aeta;
         expba = exp(- b.*Ay);
         tmpf = sum(log(1 + expba))/m + mu*norm(y,1);
@@ -105,6 +136,10 @@ while k < opts.maxit && ((isempty(opts.f_ref) && res > opts.gtol) || ...
         end
         alpha = 0.2*alpha; nls = nls + 1;
         y = x + alpha*eta;
+    end
+    if out.timedOut
+        x = xp; f = fp;
+        break;
     end
     f = tmpf;
     if alpha == 1
@@ -140,9 +175,10 @@ while k < opts.maxit && ((isempty(opts.f_ref) && res > opts.gtol) || ...
     
     k = k + 1;
     out.fvec = [out.fvec, f];
-    if isempty(opts.f_ref) && k > 8 && min(out.fvec(k-7:k)) - out.fvec(k-8) > opts.ftol
-        break;
-    end
+    % Outer stopping uses optimality and the iteration limit only.
+    % if isempty(opts.f_ref) && k > 8 && min(out.fvec(k-7:k)) - out.fvec(k-8) > opts.ftol
+    %     break;
+    % end
 end
 
 
@@ -151,6 +187,7 @@ out.dimension = out.dimension(1:k);
 out.fval = f;
 out.itr = k;
 out.tt = toc(tt);
+out.runtime = out.tt;
 out.nrmG = res;
 out.mvp_total = mvp;
 end
@@ -235,7 +272,8 @@ y(plus) = 1;
 y(minus) = -1;
 end
 
-function [x, i, mvp] = conjgrad(A, Dx, b, x, rate)
+function [x, i, mvp] = conjgrad(A, Dx, b, x, rate,shouldStop)
+    if nargin < 6; shouldStop = []; end
     mvp = 2;
     Ax = A*x;
     r = b - A'*(Dx.*(Ax));
@@ -243,7 +281,12 @@ function [x, i, mvp] = conjgrad(A, Dx, b, x, rate)
     rsold = r' * r;
     temp = norm(b);
 
-    for i = 1:50
+    i = 0;
+    for cgStep = 1:50
+        if ~isempty(shouldStop) && shouldStop()
+            break;
+        end
+        i = cgStep;
         Ap = A * p;
         mvp = mvp + 1;
         Hp = A'*(Dx.*(Ap));

@@ -1,6 +1,7 @@
 function [funv_array, xopt, resi_array, num_iter, cput, ssa, dimension, stats] = alg_rpn( x0, data, model, opts)
 
 % This function uses IRPN to solve l1-regularized logistic regression
+% opts.maxTime (seconds, default Inf) limits wall time; stats.timedOut records timeout.
 % problem. The decription of the algorithm can be found in our paper:
 
 % M.-C. Yue, Z. Zhou, A. M.-C. So:
@@ -29,6 +30,8 @@ function [funv_array, xopt, resi_array, num_iter, cput, ssa, dimension, stats] =
 %   5. ssa: the array of step sizes of each iteration
 
 if ~isfield(opts, 'opt_dim'); opts.opt_dim = 0; end
+if ~isfield(opts, 'maxTime'); opts.maxTime = Inf; end
+validateattributes(opts.maxTime,{'numeric'},{'real','scalar','nonnegative','nonnan'});
 
 
 x = x0;
@@ -60,9 +63,16 @@ mu = opts.mu;
 fprintf('IRPN rho = %1.1f is working...\n',rho);
 
 tstart = tic;
+timedOut = false;
+shouldStop = [];
+if isfinite(opts.maxTime)
+    shouldStop = @() toc(tstart) >= opts.maxTime;
+end
 mvp = 0;
 time_array = zeros(1,maxit);
 mvp_array = zeros(1,maxit);
+nupdates = 0;
+nrecorded = 0;
 
 for k=1:maxit-1
     % mu = opts.mu;
@@ -83,11 +93,19 @@ for k=1:maxit-1
     
     resi = norm(x - prox_oper_vec(x-grad,model,1),2);
     resi_array(k) = resi;
+    % Record cost after evaluating this same iterate's residual.
+    time_array(k) = toc(tstart);
+    mvp_array(k) = mvp;
+    nrecorded = k;
     
 %     fprintf('At iteration %d of RPN_CD, residual %f\n', k, resi);
     if (useGap && relative_objective_gap(funv, model.f_ref)<=model.gap_tol) || ...
             (~useGap && resi<eps)
         fprintf('RPN_CD achieves required resi accuracy\n');
+        break;
+    end
+    if ~isempty(shouldStop) && shouldStop()
+        timedOut = true;
         break;
     end
     
@@ -104,12 +122,17 @@ for k=1:maxit-1
     s = x;
     As = A*x;
     q =  A'*(Dx.*(As)) + mu*x - grad;
+    mvp = mvp + 2;
     
     % The subproblem then can be written as
     %       min_x 0.5*s^T(A'*Dx*A+mu*I)s - q^Ts + lambda*||s||_1.
     resi_in = resi;
     
     for i=1:maxitsub
+        if ~isempty(shouldStop) && shouldStop()
+            timedOut = true;
+            break;
+        end
         if resi_in<eps_in
 %             fprintf('inner finished with resi_in = %f\n', resi_in);
             break;
@@ -130,6 +153,10 @@ for k=1:maxit-1
                 break;
             end
         end
+    end
+    if timedOut || (~isempty(shouldStop) && shouldStop())
+        timedOut = true;
+        break;
     end
     
 %========================================================================================
@@ -177,11 +204,20 @@ for k=1:maxit-1
     funv_new = loss_smv(s,data) + nsm_funv(s,model);
     mvp = mvp + 1;
     while(funv_new > funv_s + funv_n + sigma*disc)
+        if ~isempty(shouldStop) && shouldStop()
+            timedOut = true;
+            break;
+        end
         ss = ss * beta;
         s = x + ss*d;
         disc = ss*dot(grad, d) + nsm_funv(s,model) - funv_n;
         funv_new = loss_smv(s,data) + nsm_funv(s,model);
         mvp = mvp + 1;
+    end
+    if timedOut || (~isempty(shouldStop) && shouldStop())
+        % The subproblem/line-search candidate has not been accepted.
+        timedOut = true;
+        break;
     end
     
     % if abs(funv-funv_new)<1e-8 
@@ -193,37 +229,37 @@ for k=1:maxit-1
     num_iter(k) = i;
     
     x = s;
-    time_array(k) = toc(tstart);
-    mvp_array(k) = mvp;
+    nupdates = nupdates + 1;
     dim = sum(abs(x)>0);
     dimension = [dimension, dim];
 %     fprintf('Iteration %d is finished with %d number of inner iterations\n\n',k,i-1);
 end
 
 xopt = x;
-cput = toc(tstart);
 
-% The objective is recorded before each update, whereas time_array and
-% mvp_array are recorded after each update. Append the final objective and
-% prepend the initial zero-time point so all returned traces refer to the
-% same iterates. This prevents the final accurate IRPN point from being
-% omitted or paired with the wrong timestamp in relative-gap plots.
-nupdates = nnz(time_array > 0);
-funv_final = loss_smv(x,data) + nsm_funv(x,model);
-mvp = mvp + 1;
-funv_array = funv_array(:);
-if numel(funv_array) < nupdates + 1
-    funv_array(end+1) = funv_final;
-else
-    funv_array = funv_array(1:nupdates+1);
-    funv_array(end) = funv_final;
+% If the iteration limit follows an update, its final point has not yet
+% been evaluated. Include that point and the cost of checking its residual.
+% On convergence, the loop has already recorded it; do not evaluate twice.
+if nrecorded == nupdates
+    nrecorded = nrecorded + 1;
+    funv_array(nrecorded) = loss_smv(x,data) + nsm_funv(x,model);
+    grad = loss_smg(x,data);
+    mvp = mvp + 3;
+    resi_array(nrecorded) = norm(x - prox_oper_vec(x-grad,model,1),2);
+    time_array(nrecorded) = toc(tstart);
+    mvp_array(nrecorded) = mvp;
 end
-resi_array = resi_array(1:min(nupdates,numel(resi_array)));
-time_array = [0, time_array(1:min(nupdates,numel(time_array)))];
-mvp_array = [0, mvp_array(1:min(nupdates,numel(mvp_array)))];
+cput = toc(tstart);
+funv_array = reshape(funv_array(1:nrecorded),[],1);
+resi_array = resi_array(1:nrecorded);
+time_array = time_array(1:nrecorded);
+mvp_array = mvp_array(1:nrecorded);
 if isfield(model,'f_ref'); f_ref = model.f_ref; else; f_ref = []; end
 stats = struct('fvec',funv_array,'timevec',time_array(:), ...
-    'mvpvec',mvp_array(:),'gapvec',relative_objective_gap(funv_array,f_ref));
+    'mvpvec',mvp_array(:),'res',resi_array(:), ...
+    'gapvec',relative_objective_gap(funv_array,f_ref), ...
+    'iter',nupdates,'runtime',cput,'mvp_total',mvp, ...
+    'maxTime',opts.maxTime,'timedOut',timedOut);
 
 fprintf('IRPN rho = %1.1f is finished.\n\n',rho);
 

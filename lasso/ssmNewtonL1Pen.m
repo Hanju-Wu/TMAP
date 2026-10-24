@@ -1,11 +1,12 @@
 function [x, out] = ssmNewtonL1Pen(A,b,N,mu,opts)
 
-tic;
+tt = tic;
 %%-------------------------------------------------------------------------
 if nargin < 5; opts = []; end
 if ~isfield(opts,'x0');    opts.x0  = zeros(N,1);   end
 if ~isfield(opts,'tol');   opts.tol = 1e-6;     end
 if ~isfield(opts,'record');opts.record = 1;     end
+if ~isfield(opts,'recordFcn'); opts.recordFcn = []; end
 if ~isfield(opts,'eps');   opts.eps = 1e-4;     end
 
 if ~isfield(opts,'comp_obj'); opts.comp_obj = 0;   end
@@ -134,6 +135,10 @@ resp_mu = res;
 nr_CG = 0;
 nr_res = 1;
 nr_Acall = 3;
+if ~isempty(opts.recordFcn)
+    fCurrent = 0.5*((grad-Atb)'*x + btb) + muf*norm(x,1);
+    opts.recordFcn(x,fCurrent,toc(tt),nr_Acall,0);
+end
 
 itTau = 0;
 switch_pow = 1;
@@ -184,6 +189,7 @@ for iter = 1:maxit
     
     xz = x + d;
     AtAd = A'*(A*d);
+    nr_Acall = nr_Acall + 2;
     gradxz = grad + AtAd;
     [Ftxz, resxz, yxz] = comp_resR(xz,gradxz);
     %[Ftxz, resxz, yxz, objz] = comp_resR(xz,gradxz);
@@ -245,6 +251,10 @@ for iter = 1:maxit
 %         resRatiop = res/resp; 
    % end
     
+    if ~isempty(opts.recordFcn)
+        fCurrent = 0.5*((grad-Atb)'*x + btb) + muf*norm(x,1);
+        opts.recordFcn(x,fCurrent,toc(tt),nr_Acall,iter);
+    end
     % stopping criteria, res/tau is comparable to SNF.m
     switch opts.crit
         case 1
@@ -376,7 +386,7 @@ resp_mu = res;
     end
     
 end %end outer loop
-out.time = toc;
+out.time = toc(tt);
 
 out.iter = iter;
 out.res  = res;
@@ -438,6 +448,5 @@ out.Acalls = nr_Acall;% + nr_res*2 + nr_CG*2;
     end
 
 end
-
 
 

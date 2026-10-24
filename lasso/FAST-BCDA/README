@@ -1,3 +1,8 @@
+Local packaging note (2026-10-24): this paper subset retains only
+Call_FAST_2CDA_ehn.m, FAST_BCDA.m and the comparison's SpaRSA alg_nmt.m.
+The other wrappers and Example.m mentioned in the original README below
+have been removed. FAST_BCDA uses quadprog (Optimization Toolbox).
+
 FAST-BCDA: Fast Active Set Block Coordinate Descent Algorithm 
 ================================================================
 

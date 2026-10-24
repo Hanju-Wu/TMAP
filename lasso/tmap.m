@@ -1,5 +1,8 @@
 function [x, out] = tmap(A,b,N,mu,opts)
-%TMAP Set opts.inner_solver to 'cg' (default) or 'lbfgs'.
+%TMAP LASSO TMAP with displacement-based sufficient-decrease evaluation.
+% One A*step per line-search trial; accepted residuals are reused for gradients.
+% opts.residualRefreshPeriod=0 (default) disables extra A*x refresh products.
+% opts.inner_solver is 'cg' (default) or 'lbfgs'.
 
 tt = tic;
 %%-------------------------------------------------------------------------
@@ -15,6 +18,11 @@ if ~isfield(opts,'cont_max'); opts.cont_max = 10;   end
 if ~isfield(opts,'crit'); opts.crit = 1;   end
 if ~isfield(opts,'stopCriterion'); opts.stopCriterion = 'proxResidual'; end
 if ~isfield(opts,'fReference'); opts.fReference = []; end
+if ~isfield(opts,'recordFcn'); opts.recordFcn = []; end
+if ~isfield(opts,'allowForcedAcceptance'); opts.allowForcedAcceptance = false; end
+if ~isfield(opts,'residualRefreshPeriod'); opts.residualRefreshPeriod = 0; end
+validateattributes(opts.residualRefreshPeriod,{'numeric'}, ...
+    {'scalar','real','finite','integer','nonnegative'});
 
 if isstring(opts.inner_solver); opts.inner_solver = char(opts.inner_solver); end
 if ~ischar(opts.inner_solver) || ...
@@ -36,6 +44,8 @@ if ~isscalar(opts.lbfgs_curvature_tol) || ...
     error('opts.lbfgs_curvature_tol must be a finite positive scalar.');
 end
 if useLBFGS
+    % Cache MEX availability for all subsequent L-BFGS directions.
+    useCompiledLBFGS = exist('lbfgsC','file') == 3;
     if ~isfield(opts,'lbfgs_descent_fraction')
         opts.lbfgs_descent_fraction = 0.9;
     end
@@ -45,7 +55,7 @@ if useLBFGS
         error('opts.lbfgs_descent_fraction must be in [0,1].');
     end
 else
-    if ~isfield(opts,'lambda'); opts.lambda = 1e-4; end
+    if ~isfield(opts,'lambda'); opts.lambda = 1e-1; end
     if ~isfield(opts,'CG_maxit'); opts.CG_maxit = 5; end
     if ~isfield(opts,'CG_tol'); opts.CG_tol = 1e-1; end
     if ~isfield(opts,'CG_adapt'); opts.CG_adapt = 1; end
@@ -75,12 +85,18 @@ end
 % first computations
 num_Ax      = 0;
 num_ATy     = 0;
-Atb         = A'*(b);
-num_ATy     = num_ATy + 1;
+% No separate A'*b product is needed: gradients use the cached data residual.
+residualRefreshCount = 0;
+% Column nonzero counts: a product with A(:,I) costs sum(colNnz(I))/totalNnz
+% of a full product with A.  Used for the dimension-weighted MVP count.
+colNnz      = full(sum(A ~= 0,1));
+totalNnz    = max(sum(colNnz),1);
+weightedCG  = 0; % CG products in units of full products with A
 
 x = sparse(x);
-[funcx, Ax] = func(x);
+dataResidual = A*x-b;
 num_Ax = num_Ax + 1;
+funcx = 0.5*(dataResidual'*dataResidual) + mu*norm(x,1);
 
 % compute residual function p = F_tau(x)
 [Ftx, res, ~, grad] = comp_res(x);
@@ -99,7 +115,14 @@ if opts.cont
     cont_count  = 1;
 end
 
-if opts.cont; resp_mu = res; end
+if opts.cont
+    % Keep the state consistent after changing the continuation penalty.
+    [Ftx,res] = proximalResidual(x,grad);
+    epsilonk = min(epsilon,res);
+    funcx = 0.5*(dataResidual'*dataResidual) + mu*norm(x,1);
+    resp = res;
+    resp_mu = res;
+end
 
 nr_CG = 0;
 S = cell(0,1);
@@ -118,22 +141,64 @@ else
     out.cg = zeros(maxit,1);
 end
 out.lbfgs = zeros(maxit,1);
+out.backtracks = zeros(maxit,1);
+out.forcedAcceptance = false(maxit,1);
+out.lineSearchTrials = zeros(maxit,1);
+out.lineSearchDelta = zeros(maxit,1);
+out.lineSearchRHS = zeros(maxit,1);
+out.stepSize = zeros(maxit,1);
+out.msg = 'iteration limit';
+out.wsize = zeros(maxit,1);      % |I_minus| per iteration
+out.wfrac = zeros(maxit,1);      % nnz(A(:,I_minus))/nnz(A) per iteration
+out.mvp_weighted_vec = zeros(maxit + 1,1);
 out.inner_solver = lower(opts.inner_solver);
-if useLBFGS && exist('lbfgsC','file') == 3
+if useLBFGS && useCompiledLBFGS
     out.lbfgsImplementation = 'lbfgsC';
 elseif useLBFGS
     out.lbfgsImplementation = 'local';
 else
     out.lbfgsImplementation = 'not applicable';
 end
-out.fvec(1) = targetObjective(x,Ax);
+out.fvec(1) = targetObjective(x,dataResidual);
 out.nnzvec(1) = nnz(x);
 out.num_Ax(1) = num_Ax;
 out.num_ATy(1) = num_ATy;
 out.mvp(1) = num_Ax + num_ATy;
+out.mvp_weighted_vec(1) = out.mvp(1);
 out.timevec(1) = toc(tt);
+if ~isempty(opts.recordFcn)
+    opts.recordFcn(x,out.fvec(1),out.timevec(1),out.mvp(1),0);
+end
 
+completedIterations = 0;
 for iter = 1:maxit
+    if stoppingSatisfied(x,funcx,res)
+        out.msg = 'optimal';
+        break;
+    end
+    if opts.residualRefreshPeriod > 0 && mod(iter,opts.residualRefreshPeriod)==0
+        dataResidual = A*x-b;
+        num_Ax = num_Ax + 1;
+        residualRefreshCount = residualRefreshCount + 1;
+        [Ftx,res,~,grad] = comp_res(x);
+        num_ATy = num_ATy + 1;
+        epsilonk = min(epsilon,res);
+        funcx = 0.5*(dataResidual'*dataResidual) + mu*norm(x,1);
+        resp = res;
+        if opts.cont; resp_mu = res; end
+        if stoppingSatisfied(x,funcx,res)
+            out.msg = 'optimal';
+            current = completedIterations+1;
+            out.fvec(current) = targetObjective(x,dataResidual);
+            out.num_Ax(current) = num_Ax;
+            out.num_ATy(current) = num_ATy;
+            out.mvp(current) = num_Ax+num_ATy;
+            out.mvp_weighted_vec(current) = ...
+                (num_Ax+num_ATy-2*nr_CG)+weightedCG;
+            out.timevec(current) = toc(tt);
+            break;
+        end
+    end
     xp = x;
     gradp = grad;
     
@@ -149,6 +214,8 @@ for iter = 1:maxit
 
     % Build the working-set direction with either truncated CG or L-BFGS.
     d   = grad;
+    out.wsize(iter) = nnz(I_minus);
+    out.wfrac(iter) = sum(colNnz(I_minus))/totalNnz;
     if useLBFGS
         if any(I_minus)
             [d(I_minus),nPairs] = lbfgsDirection( ...
@@ -170,57 +237,73 @@ for iter = 1:maxit
         nr_CG = nr_CG + iterd;
         num_Ax = num_Ax + iterd;
         num_ATy = num_ATy + iterd;
+        weightedCG = weightedCG + 2*iterd*out.wfrac(iter);
         out.cg(iter) = iterd;
         linesearch_I_minus = (1-CG_tol)*sig*norm(d(I_minus))^2;
     end
     %----------------------------------------------------------------------
     
-    % line search
+    % Evaluate the same sufficient-decrease condition via an objective
+    % increment. Keep the base residual fixed across rejected trials.
     t = 1;
     [xz, nrm_dx_plus] = proj(x, d, t);
     xz = sparse(xz);
-
     nls = 0;
-    while 1
-        [funcxz, Ax] = func(xz);
+    while true
+        if nnz(xz-x)==0
+            error('TMAP:LineSearchStall', ...
+                'No representable trial satisfies sufficient decrease.');
+        end
+        [objectiveChange,trialResidual] = ...
+            lasso_trial_increment(A,x,xz,dataResidual,mu);
         num_Ax = num_Ax + 1;
-        if  funcxz - funcx <= -sigma*t*linesearch_I_minus - sigma/t*nrm_dx_plus^2 %|| nls == 5
+        decreaseBound = -sigma*t*linesearch_I_minus - sigma/t*nrm_dx_plus^2;
+        sufficientDecrease = isfinite(objectiveChange) && ...
+            isfinite(decreaseBound) && objectiveChange <= decreaseBound;
+        forced = opts.allowForcedAcceptance && ~useLBFGS && nls==5;
+        if sufficientDecrease || (forced && isfinite(objectiveChange))
             break;
         end
-            
-        t = 0.2*t; nls = nls + 1;
+        if nls >= 500 || t < realmin
+            error('TMAP:LineSearchStall', ...
+                'No representable trial satisfies sufficient decrease.');
+        end
+        t = 0.2*t;
+        nls = nls + 1;
         [xz, nrm_dx_plus] = proj(x, d, t);
         xz = sparse(xz);
     end
-
+    out.backtracks(iter) = nls;
+    out.lineSearchTrials(iter) = nls+1;
+    out.lineSearchDelta(iter) = objectiveChange;
+    out.lineSearchRHS(iter) = decreaseBound;
+    out.stepSize(iter) = t;
+    out.forcedAcceptance(iter) = ~sufficientDecrease;
+    dataResidual = trialResidual;
+    funcxz = 0.5*(dataResidual'*dataResidual) + mu*norm(xz,1);
     [Ftx, resxz, ~, gradxz] = comp_res(xz);
     num_ATy = num_ATy + 1;
     x = xz; res = resxz; grad = gradxz; epsilonk = min(epsilon, res);
+    completedIterations = iter;
     if useLBFGS
         [S,Y,Hdiag] = updateLBFGSHistory( ...
             S,Y,Hdiag,x-xp,grad-gradp,opts.lbfgs_mem, ...
             opts.lbfgs_curvature_tol);
     end
     funcx = funcxz;
-    out.fvec(iter + 1) = targetObjective(x,Ax);
+    out.fvec(iter + 1) = targetObjective(x,dataResidual);
     out.nnzvec(iter + 1) = nnz(x);
     out.num_Ax(iter + 1) = num_Ax;
     out.num_ATy(iter + 1) = num_ATy;
     out.mvp(iter + 1) = num_Ax + num_ATy;
+    out.mvp_weighted_vec(iter + 1) = (num_Ax + num_ATy - 2*nr_CG) + weightedCG;
     out.timevec(iter + 1) = toc(tt);
+    if ~isempty(opts.recordFcn)
+        opts.recordFcn(x,out.fvec(iter+1),out.timevec(iter+1),out.mvp(iter+1),iter);
+    end
              
     % stopping criteria
-    if strcmp(opts.stopCriterion,'relativeFunctionGap')
-        cstop = (mu <= (1+1e-10)*muf) && ...
-            ((funcx - opts.fReference)/max(1,abs(opts.fReference)) <= tol);
-    elseif opts.crit == 2
-        cstop = (mu <= (1+1e-10)*muf) && ...
-            ((funcx - fopt)/max(1,abs(fopt)) <= tol);
-    else
-        cstop = (mu <= (1+1e-10)*muf) && (res <= tol);
-    end
-    
-    if cstop
+    if stoppingSatisfied(x,funcx,res)
         out.msg = 'optimal';
         break;
     end
@@ -233,6 +316,7 @@ for iter = 1:maxit
         end
             
         % continuation: update mu
+        previousMu = mu;
         if opts.cont
             if goodIter
                 muredf = 0.2;
@@ -248,6 +332,11 @@ for iter = 1:maxit
             end
         end
         
+        if mu ~= previousMu
+            [Ftx,res] = proximalResidual(x,grad);
+            epsilonk = min(epsilon,res);
+            funcx = 0.5*(dataResidual'*dataResidual) + mu*norm(x,1);
+        end
         if opts.cont; resp_mu = res; end
 
      %   update CG parameters if final mu is reached
@@ -271,9 +360,24 @@ for iter = 1:maxit
         resp = res;
     
 end %end outer loop
+% Continuation may reach the target penalty on the final allowed iteration.
+% Report that state consistently even when there is no next loop entry.
+if stoppingSatisfied(x,funcx,res)
+    out.msg = 'optimal';
+end
+iter = completedIterations;
 out.time = toc(tt);
 out.runtime = out.time;
 
+out.backtracks = out.backtracks(1:iter);
+out.lineSearchTrials = out.lineSearchTrials(1:iter);
+out.lineSearchDelta = out.lineSearchDelta(1:iter);
+out.lineSearchRHS = out.lineSearchRHS(1:iter);
+out.stepSize = out.stepSize(1:iter);
+out.residualRefreshCount = residualRefreshCount;
+out.dataResidual = dataResidual;
+out.lineSearchEvaluation = 'objective increment';
+out.forcedAcceptance = out.forcedAcceptance(1:iter);
 out.iter = iter;
 out.res  = res;
 out.f = funcx;
@@ -286,10 +390,15 @@ out.nnzvec = out.nnzvec(1:iter + 1);
 out.num_Ax = out.num_Ax(1:iter + 1);
 out.num_ATy = out.num_ATy(1:iter + 1);
 out.mvp = out.mvp(1:iter + 1);
+out.wsize = out.wsize(1:iter);
+out.wfrac = out.wfrac(1:iter);
+out.mvp_weighted_vec = out.mvp_weighted_vec(1:iter + 1);
 out.timevec = out.timevec(1:iter + 1);
 out.num_Ax_total = num_Ax;
 out.num_ATy_total = num_ATy;
 out.mvp_total = num_Ax + num_ATy;
+% Full products counted once; CG products weighted by the working-set share.
+out.mvp_weighted = (num_Ax + num_ATy - 2*nr_CG) + weightedCG;
 out.Acalls = out.mvp_total;
 
     function ss = shringkage(xx,mumu)
@@ -297,19 +406,35 @@ out.Acalls = out.mvp_total;
     end
 
     function [Ftx, res, yx, grad] = comp_res(xx)
-        grad   = A'*(Ax) - Atb;
-        yx     = xx - grad;
-        Ftx    = xx - shringkage(yx,mu);
-        res    = norm(Ftx); 
+        grad = A'*dataResidual;
+        [Ftx,res,yx] = proximalResidual(xx,grad);
     end
 
-    function [fv,Ax] = func(xx)
-        Ax = A*xx;
-       fv = mu*norm(xx,1) + 0.5*norm(Ax-b)^2; 
+    function [Ftx,res,yx] = proximalResidual(xx,gg)
+        yx = xx-gg;
+        Ftx = xx-shringkage(yx,mu);
+        res = norm(Ftx);
     end
 
-    function fv = targetObjective(xx,Axx)
-        fv = muf*norm(xx,1) + 0.5*norm(Axx-b)^2;
+    function fv = targetObjective(xx,rr)
+        fv = muf*norm(xx,1) + 0.5*(rr'*rr);
+    end
+
+    function satisfied = stoppingSatisfied(xx,objective,proxResidual)
+        atTargetPenalty = mu <= (1+1e-10)*muf;
+        if strcmp(opts.stopCriterion,'relativeFunctionGap')
+            satisfied = atTargetPenalty && ...
+                (objective-opts.fReference)/max(1,abs(opts.fReference)) <= tol;
+        elseif strcmp(opts.stopCriterion,'relativeKKT')
+            % Relative KKT residual of Li, Sun and Toh (SSNAL).
+            satisfied = atTargetPenalty && ...
+                proxResidual/(1+norm(xx)+norm(dataResidual)) <= tol;
+        elseif opts.crit == 2
+            satisfied = atTargetPenalty && ...
+                (objective-fopt)/max(1,abs(fopt)) <= tol;
+        else
+            satisfied = atTargetPenalty && proxResidual <= tol;
+        end
     end
 
     function [y, nrm_dx_plus] = proj(xx, d, t)
@@ -346,7 +471,8 @@ out.Acalls = out.mvp_total;
             S = S(2:end);
             Y = Y(2:end);
         end
-        S{end+1,1} = s;
+        % Dense history avoids repeated sparse logical indexing on working sets.
+        S{end+1,1} = full(s);
         Y{end+1,1} = y;
     end
 
@@ -375,7 +501,7 @@ out.Acalls = out.mvp_total;
             Swork(:,j) = S{valid(j)}(mask);
             Ywork(:,j) = Y{valid(j)}(mask);
         end
-        if exist('lbfgsC','file') == 3
+        if useCompiledLBFGS
             d = lbfgsC(g,Swork,Ywork,Hdiag);
         else
             d = localLBFGS(g,Swork,Ywork,Hdiag);
@@ -410,8 +536,10 @@ out.Acalls = out.mvp_total;
         elseif any(strcmp(key,{'relativefunctiongap','relative-function-gap', ...
                 'relative_function_gap','functiongap','function-gap'}))
             criterion = 'relativeFunctionGap';
+        elseif any(strcmp(key,{'relativekkt','relative-kkt','relative_kkt','kkt'}))
+            criterion = 'relativeKKT';
         else
-            error('opts.stopCriterion must be ''proxResidual'' or ''relativeFunctionGap''.');
+            error('opts.stopCriterion must be ''proxResidual'', ''relativeKKT'' or ''relativeFunctionGap''.');
         end
     end
 

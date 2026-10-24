@@ -1,5 +1,7 @@
 function [w,out] = L1General2_PSSgb(funObj,w,lambda,options)
 %L1GENERAL2_PSSGB Projected-scaled subgradient method with CG or L-BFGS.
+% options.maxTime (seconds, default Inf) returns the last accepted iterate
+% on timeout, with out.timedOut=true. Native operations finish before checks.
 % For LogisticLoss and SquaredError, each [f,g] evaluation performs one
 % data-matrix product and one transpose data-matrix product.  Use
 % options.lossType to override automatic detection, or options.mvpPerEval
@@ -20,7 +22,14 @@ elseif isempty(options)
     options = struct();
 end
 options = normalizeOptionAliases(options);
+if ~isfield(options,'recordFcn'); options.recordFcn = []; end
 tt = tic;
+if ~isfield(options,'maxTime'); options.maxTime = Inf; end
+validateattributes(options.maxTime,{'numeric'},{'real','scalar','nonnegative','nonnan'});
+shouldStop = [];
+if isfinite(options.maxTime)
+    shouldStop = @() toc(tt) >= options.maxTime;
+end
 
 [verbose,optTol,progTol,maxIter,suffDec,corrections,Dtype,quadraticInit, ...
     lossType,mvpPerEval,objectiveScale,innerSolver,cgOperator,cgTol, ...
@@ -48,6 +57,19 @@ objectiveScale = resolveObjectiveScale(lossType,objectiveScale);
     cgRegularization,cgRegularizationDecay,cgRegularizationMin, ...
     cgPreconditioner,mvpPerHvp,lossType);
 cgOperator = resolveCgOperator(cgOperator,funObj,lossType,length(w),useCG);
+% Column nonzero counts of the data matrix for the dimension-weighted MVP count.
+colNnz = [];
+if useCG
+    try
+        dataMatrixForCost = objectiveClosureData(funObj,length(w),lossType);
+        colNnz = full(sum(dataMatrixForCost ~= 0,1));
+        clear dataMatrixForCost;
+    catch
+        colNnz = [];
+    end
+end
+totalNnz = max(sum(colNnz),1);
+weightedHvp = 0; % CG products in units of full products with the data matrix
 stopCriterion = resolveStopCriterion(stopCriterion);
 if strcmp(stopCriterion,'relativeFunctionGap') && ...
         (isempty(fReference) || ~isscalar(fReference) || ~isfinite(fReference))
@@ -74,7 +96,12 @@ acceptedIter = 0;
 out = initializeOutput( ...
     f,funEvals,lossType,mvpPerEval,objectiveScale,w,toc(tt), ...
     innerSolver,mvpPerHvp,res,stopCriterion);
+out.maxTime = options.maxTime;
+out.timedOut = false;
 numHvp = 0;
+if ~isempty(options.recordFcn)
+    options.recordFcn(w,out.fvec(end),out.timevec(end),out.mvp(end),0);
+end
 
 % Check optimality
 optCond = max(abs(g));
@@ -89,12 +116,17 @@ end
 
 %% Main loop
 for i = 1:maxIter
+    if ~isempty(shouldStop) && shouldStop()
+        out.timedOut = true;
+        break;
+    end
     out.outerIter = i;
     cgRanThisIteration = false;
     
     % Compute active set
     W = lambda ==0 | w ~=0;
     A = W==0;
+    out.wsize(i,1) = nnz(W);
     
     % Compute direction
     d = zeros(p,1);
@@ -116,9 +148,15 @@ for i = 1:maxIter
                 end
                 precf = makeCgPreconditioner(cgPreconditioner,w,W,sig);
                 [d(W),cgIts,cgInfo] = mypcg_pssgb( ...
-                    hessOp,-g(W),currentCgTol,currentCgMaxIter,precf,sig);
+                    hessOp,-g(W),currentCgTol,currentCgMaxIter,precf,sig,shouldStop);
                 cgRanThisIteration = true;
                 numHvp = numHvp + cgIts;
+                if ~isempty(colNnz)
+                    out.wfrac(i,1) = sum(colNnz(W))/totalNnz;
+                else
+                    out.wfrac(i,1) = nnz(W)/numel(W);
+                end
+                weightedHvp = weightedHvp + sum(mvpPerHvp)*cgIts*out.wfrac(i,1);
                 out.cg(i,1) = cgIts;
                 out.cgInfo(i,1) = cgInfo;
                 out.cgTol(i,1) = currentCgTol;
@@ -160,6 +198,10 @@ for i = 1:maxIter
         d(A) = -D.*g(A);
         t = 1;
     end
+    if ~isempty(shouldStop) && shouldStop()
+        out.timedOut = true;
+        break;
+    end
     g_old = g;
     w_old = w;
     
@@ -167,14 +209,15 @@ for i = 1:maxIter
     xi = sign(w);
     xi(w==0) = sign(-g(w==0));
     
-    % Compute directional derivative, check that we can make progress
+    % Compute directional derivative for the line search.
     gtd = g'*d;
-    if gtd > -progTol
-        if verbose
-            fprintf('Directional derivative below progTol\n');
-        end
-        break;
-    end
+    % Outer stopping uses optimality and iteration/evaluation limits only.
+    % if gtd > -progTol
+    %     if verbose
+    %         fprintf('Directional derivative below progTol\n');
+    %     end
+    %     break;
+    % end
     
     if quadraticInit
         if i > 1
@@ -190,6 +233,10 @@ for i = 1:maxIter
     
     % Line search along projection arc
     while f_new > f + suffDec*g'*(w_new-w) || ~isLegal(f_new)
+        if ~isempty(shouldStop) && shouldStop()
+            out.timedOut = true;
+            break;
+        end
         t_old = t;
         
         % Backtracking
@@ -236,6 +283,11 @@ for i = 1:maxIter
         [f_new,g_new,smoothGrad_new] = pseudoGrad(funObj,w_new,lambda);
         funEvals = funEvals+1;
     end
+    if out.timedOut || (~isempty(shouldStop) && shouldStop())
+        % w, f and g still describe the last accepted point.
+        out.timedOut = true;
+        break;
+    end
     
     % Take step
     w = w_new;
@@ -252,6 +304,9 @@ for i = 1:maxIter
     out = appendOutput( ...
         out,f,funEvals,mvpPerEval,objectiveScale,w,acceptedIter, ...
         stepAccepted,toc(tt),numHvp,mvpPerHvp,res);
+    if ~isempty(options.recordFcn)
+        options.recordFcn(w,out.fvec(end),out.timevec(end),out.mvp(end),acceptedIter);
+    end
     
     % Output Log
     if verbose
@@ -318,6 +373,8 @@ out.nr_CG = numHvp;
 out.num_Ax_total = mvpPerEval(1)*funEvals + mvpPerHvp(1)*numHvp;
 out.num_ATy_total = mvpPerEval(2)*funEvals + mvpPerHvp(2)*numHvp;
 out.mvp_total = out.num_Ax_total + out.num_ATy_total;
+% Function evaluations are full products; CG products weighted by |W| share.
+out.mvp_weighted = sum(mvpPerEval)*funEvals + weightedHvp;
 out.nnz = nnz(w);
 out.runtime = toc(tt);
 
@@ -660,6 +717,8 @@ out.timevec = elapsedTime;
 out.funEvals = funEvals;
 out.numHvp = 0;
 out.cg = zeros(0,1);
+out.wsize = zeros(0,1);
+out.wfrac = zeros(0,1);
 out.cgInfo = zeros(0,1);
 out.cgTol = zeros(0,1);
 out.cgMaxIter = zeros(0,1);

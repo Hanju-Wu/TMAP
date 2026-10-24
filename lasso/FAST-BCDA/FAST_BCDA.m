@@ -95,6 +95,7 @@ function [x,fopt,ttot,iter,errVec,timeVec,res,mvp]=...
 
 %start clock
 t = cputime;
+wallTimer = tic;
 %tic
 
 % test for number of required parametres
@@ -117,6 +118,7 @@ memory=0.05*m;
 fixup=0;
 verbosity = 0;
 fref = [];
+recordFcn = [];
 
 
 % Read the optional parameters
@@ -147,6 +149,8 @@ else
                 verbosity = varargin{i+1};
             case 'FREF'
                 fref = varargin{i+1};
+            case 'RECORDFCN'
+                recordFcn = varargin{i+1};
             otherwise
                 % something wrong with the parameter string
                 error(['Unrecognized option: ''' varargin{i} '''']);
@@ -215,6 +219,9 @@ while (it<=maxit)
         mvp=mvp+1;
     end
     f = 0.5*r'*r + tau*norm(x,1);
+    if ~isempty(recordFcn)
+        recordFcn(x,f,toc(wallTimer),mvp,it-1);
+    end
     if (stopcr == 3 && res <= tolstop) || ...
             (stopcr == 4 && ~isempty(fref) && ...
             (f-fref)/max(1,abs(fref)) <= tolstop)
@@ -446,9 +453,14 @@ ttot = cputime - t;
 
 %print final info
 r=a*x-b;
+mvp=mvp+1;
 f=0.5*r'*r;
 f=f+tau*norm(x,1);
 fopt=f;
+% At the iteration limit the last completed sweep has no next loop entry.
+if ~isempty(recordFcn) && it > maxit
+    recordFcn(x,f,toc(wallTimer),mvp,it-1);
+end
 fprintf(1,'iter = %3d, f= %10.3e, tottime=%10.3e \n'...
     ,it, f,ttot);
 iter=it;

@@ -14,16 +14,25 @@ N       = 2^14;
 M       = floor(N/4);
 % number of nonzeros
 K       = floor(M*rho);
+T = int64(rho*M);
+delta = 0.8;
+fastMemory = int64(0.8*delta*T); % maximum candidate coordinates per FAST sweep
 
-T=int64(rho*M);
-tolOverride = getenv('LASSO_TOL');
-if isempty(tolOverride)
-    tol = 1e-6;
+tolerancesOverride = getenv('LASSO_TOLS');
+tolOverride = getenv('LASSO_TOL'); % legacy single-target entry point
+if ~isempty(tolerancesOverride)
+    tolerances = sscanf(tolerancesOverride,'%f');
+elseif ~isempty(tolOverride)
+    tolerances = str2double(tolOverride);
 else
-    tol = str2double(tolOverride);
+    tolerances = [1e-4;1e-8;1e-12];
 end
-% Number of independently generated instances.  Set this to 100 for the
-% paper-scale experiment; a smaller value is useful for a quick smoke test.
+validateattributes(tolerances,{'numeric'}, ...
+    {'vector','real','positive','finite','nonempty'});
+tolerances = unique(tolerances(:),'stable');
+tol = min(tolerances); % one solver call, continuing to the strictest target
+% Number of independently generated instances: 10 per sparsity level.
+% A smaller value is useful for a quick smoke test.
 instanceOverride = getenv('LASSO_INSTANCES');
 if isempty(instanceOverride)
     numInstances = 10;
@@ -32,23 +41,32 @@ else
 end
 criterionOverride = getenv('LASSO_STOP_CRITERION');
 if isempty(criterionOverride)
-    stopCriterion = 'proxResidual';
+    stopCriterion = 'relativeFunctionGap';
 else
     stopCriterion = criterionOverride;
 end
+if ~strcmpi(stopCriterion,'relativeFunctionGap')
+    error('Gaussian:StopCriterion', ...
+        'Gaussian checkpoint tables require relativeFunctionGap stopping.');
+end
 maxOuterIter = 1000;
-times = nan(numInstances,7);
-rawMvp = nan(numInstances,7);
-outerIterations = nan(numInstances,7);
-proxResidual = nan(numInstances,7);
-relativeRecoveryError = nan(numInstances,7);
-relativeFunctionGap = nan(numInstances,7);
-success = false(numInstances,7);
+method = {'PSSgb-L-BFGS';'FAST-2CDA-E'; ...
+    'SpaRSA';'TMAP-CG';'TMAP-L-BFGS';'ASSN'};
+runHistory = cell(numInstances,numel(method));
+references = cell(numInstances,1);
+metricTable = table();
+outputFolder = fullfile(thisDir,'output');
+if ~exist(outputFolder,'dir'); mkdir(outputFolder); end
+outputStem = sprintf('gaussian-n2^%d-rho-%.2f',round(log2(N)),rho);
 
 x0 = zeros(N,1);
 
 for i=1:numInstances
 %% data
+% Fixed seed per (rho, instance) so every instance can be regenerated.
+instanceSeed = 1000*round(100*rho) + i;
+rng(instanceSeed,'twister');
+instanceRng = rng;
 A = 1/sqrt(2*N)*randn(M,N);
 
 e = 1e-2*randn(M,1); %noise
@@ -59,48 +77,54 @@ tau = 0.1*norm(A'*b,'inf');
 
 % Build one high-accuracy reference objective for this instance. The
 % reference solve is excluded from all reported runtimes.
-refOpts = struct('maxit',100,'tol',1e-8,'x0',x0,'crit',1, ...
-    'cont',1,'inner_solver','cg','stopCriterion','proxResidual');
-[xRef,~] = tmap(A,b,N,tau,refOpts);
+refOpts = struct('maxit',1000,'tol',1e-10,'x0',x0,'crit',1, ...
+    'cont',1,'inner_solver','cg','stopCriterion','proxResidual', ...
+    'allowForcedAcceptance',false);
+[xRef,refOut] = tmap(A,b,N,tau,refOpts);
+refGradient = A'*(A*xRef-b);
+refProxPoint = sign(xRef-refGradient).*max(abs(xRef-refGradient)-tau,0);
+referenceResidual = norm(xRef-refProxPoint);
+if ~isfinite(referenceResidual) || referenceResidual > refOpts.tol
+    error('Gaussian:ReferenceNotConverged', ...
+        ['Instance %d: TMAP-CG reference residual %.3e exceeds %.3e ', ...
+        'after %d iterations. Comparison aborted.'], ...
+        i,referenceResidual,refOpts.tol,refOut.iter);
+end
 fReference = lassoObjective(xRef,A,b,tau);
+fprintf('Reference TMAP-CG: residual %.3e, %d iterations, f_ref %.16e\n', ...
+    referenceResidual,refOut.iter,fReference);
+references{i} = struct('fReference',fReference,'residual',referenceResidual, ...
+    'tol',refOpts.tol,'iter',refOut.iter,'runtime',refOut.runtime, ...
+    'seed',instanceSeed,'rng',instanceRng);
 
 %% PSSgb-LBFGS
 lambda = 2*tau*ones(N,1); % Penalize the absolute value of each element by the same amount
 funObj = @(w)SquaredError(w,A,b); % Loss function that L1 regularization is applied to
 w_init = x0; % Initial value for iterative optimizer
+options = struct();
 options.lossType = 'lasso';
 options.maxIter = maxOuterIter;
 options.objectiveScale = 0.5;
 options.optTol = tol;
-options.stop_criterion = 'proxResidual';
 options.stopCriterion = stopCriterion;
 options.fReference = fReference;
 options.inner_solver = 'lbfgs';
 fprintf('\nComputing LASSO Coefficients...\n');
+[recordPoint,finishRecord] = lasso_gap_recorder(fReference,tolerances);
+options.recordFcn = recordPoint;
 [wLASSO_pssgb_lbfgs,out_pssgb_lbfgs] = L1General2_PSSgb( ...
     funObj,w_init,lambda,options);
-
-%% PSSgb-CG
-options.inner_solver = 'cg';
-options.CG_tol = 1e-1;
-options.CG_maxit = 10;
-options.CG_adapt = 1;
-fprintf('\nComputing PSSgb-CG LASSO coefficients...\n');
-[wLASSO_pssgb_cg,out_pssgb_cg] = L1General2_PSSgb( ...
-    funObj,w_init,lambda,options);
+runHistory{i,1} = finishRecord();
 
 %% FAST-2CDA_ehn
-verbosity=0;
-delta=0.8;
-
-tic;
+[recordPoint,finishRecord] = lasso_gap_recorder(fReference,tolerances);
 
 [xour2acc,tottime2acc,err2acc,errlsq2acc,...
     iter2acc, f2acc, errVec2acc, timeVec2acc,res2acc,fast_mvp] =  ...
     Call_FAST_2CDA_ehn(A,b, x, tau,...
-    tol,int64(0.8*delta*T),'stopCriterion',stopCriterion,'fref',fReference);
-
-t2acc = toc;
+    tol,'memory',fastMemory,'stopCriterion',stopCriterion,'fref',fReference, ...
+    'recordFcn',recordPoint);
+runHistory{i,2} = finishRecord();
 
 %% SpaRSA
 
@@ -114,8 +138,11 @@ opts.beta = 0.2;
 opts.tol = tol;
 opts.stopCriterion = stopCriterion;
 opts.fReference = fReference;
+[recordPoint,finishRecord] = lasso_gap_recorder(fReference,tolerances);
+opts.recordFcn = recordPoint;
 [funv1, x1, resi1, numit1, cput1, ~, spaRSA_mvp] = ...
     alg_nmt(A, b, x0, tau, opts);
+runHistory{i,3} = finishRecord();
 
 %% TMAP
 
@@ -128,10 +155,17 @@ opts.cont = 0;
 opts.stopCriterion = stopCriterion;
 opts.fReference = fReference;
 opts.inner_solver = 'cg';
+opts.allowForcedAcceptance = false;
+[recordPoint,finishRecord] = lasso_gap_recorder(fReference,tolerances);
+opts.recordFcn = recordPoint;
 [x_tmap_cg,out_tmap_cg] = tmap(A,b,N,tau,opts);
+runHistory{i,4} = finishRecord();
 
 opts.inner_solver = 'lbfgs';
+[recordPoint,finishRecord] = lasso_gap_recorder(fReference,tolerances);
+opts.recordFcn = recordPoint;
 [x_tmap_lbfgs,out_tmap_lbfgs] = tmap(A,b,N,tau,opts);
+runHistory{i,5} = finishRecord();
 
 %% ASSN
 opts = struct();
@@ -144,109 +178,79 @@ if strcmpi(stopCriterion,'relativeFunctionGap')
     opts.fopt = fReference;
 end
 opts.cont = 0;
-[x_ssn,out_ssn]     = ssmNewtonL1Pen(A,b,N,tau,opts);
-%% Unified per-instance metrics
-solutions = {wLASSO_pssgb_lbfgs,wLASSO_pssgb_cg,xour2acc,x1,...
-    x_tmap_cg,x_tmap_lbfgs,x_ssn};
-times(i,:) = [out_pssgb_lbfgs.runtime out_pssgb_cg.runtime ...
-    t2acc cput1 out_tmap_cg.runtime ...
-    out_tmap_lbfgs.runtime out_ssn.time];
-rawMvp(i,:) = [out_pssgb_lbfgs.mvp_total(end) out_pssgb_cg.mvp_total(end) ...
-    fast_mvp(end) spaRSA_mvp(end) out_tmap_cg.mvp_total(end) ...
-    out_tmap_lbfgs.mvp_total(end) out_ssn.Acalls(end)];
-outerIterations(i,:) = [out_pssgb_lbfgs.iter out_pssgb_cg.iter ...
-    iter2acc numit1 out_tmap_cg.iter ...
-    out_tmap_lbfgs.iter out_ssn.iter];
-for methodIndex = 1:7
-    [proxResidual(i,methodIndex),relativeRecoveryError(i,methodIndex), ...
-        relativeFunctionGap(i,methodIndex)] = ...
-        lassoInstanceMetrics(solutions{methodIndex},A,b,tau,x,fReference);
-    if strcmpi(stopCriterion,'relativeFunctionGap')
-        success(i,methodIndex) = isfinite(relativeFunctionGap(i,methodIndex)) && ...
-            relativeFunctionGap(i,methodIndex) <= tol;
-    else
-        success(i,methodIndex) = isfinite(proxResidual(i,methodIndex)) && ...
-            proxResidual(i,methodIndex) <= tol;
-    end
-end
-fprintf('Instance %d/%d complete. Success rate so far: %s\n',i,numInstances,...
-    sprintf('%.1f%% ',100*mean(success(1:i,:),1)));
-end
-
-method = {'PSSgb-L-BFGS';'PSSgb-CG';'FAST-2CDA-E'; ...
-    'SpaRSA';'TMAP-CG';'TMAP-L-BFGS';'ASSN'};
-figure;
-plotData = times;
-plotData(~success) = NaN;
-validGroups = any(isfinite(plotData),1);
-if size(plotData,1) >= 2 && any(validGroups)
-    boxplot(plotData(:,validGroups), 'Labels', method(validGroups).');
-elseif size(plotData,1) == 1
-    plot(times, 'o');
-    set(gca,'XTick',1:numel(method),'XTickLabel',method);
-    title('One-instance timing (boxplot requires at least two observations)');
-else
-    close(gcf);
-end
-ylabel('CPU time (s)');
-grid on;
-
-successfulTimes = times;
-successfulTimes(~success) = NaN;
-successfulMvp = rawMvp;
-successfulMvp(~success) = NaN;
-comparisonTable = table(method,mean(successfulTimes,1,'omitnan').', ...
-    std(successfulTimes,0,1,'omitnan').',mean(successfulMvp,1,'omitnan').', ...
-    std(successfulMvp,0,1,'omitnan').',mean(success,1).', ...
-    'VariableNames',{'method','meanTime','stdTime','meanRawMVP', ...
-    'stdRawMVP','successRate'});
-disp(comparisonTable);
-
-metricTable = table();
-for methodIndex = 1:7
-    rows = table(repmat({method{methodIndex}},numInstances,1), ...
-        (1:numInstances).',times(:,methodIndex),rawMvp(:,methodIndex), ...
-        outerIterations(:,methodIndex),proxResidual(:,methodIndex), ...
-        relativeRecoveryError(:,methodIndex),relativeFunctionGap(:,methodIndex), ...
-        success(:,methodIndex), ...
-        'VariableNames',{'method','instance','cpuTime','rawMVP', ...
-        'outerIterations','proxResidual','relativeRecoveryError', ...
-        'relativeFunctionGap','success'});
+[recordPoint,finishRecord] = lasso_gap_recorder(fReference,tolerances);
+opts.recordFcn = recordPoint;
+[x_ssn,out_ssn] = ssmNewtonL1Pen(A,b,N,tau,opts);
+runHistory{i,6} = finishRecord();
+%% First crossings from the six single-run trajectories
+for methodIndex = 1:numel(method)
+    rows = lasso_gap_checkpoint_metrics(runHistory{i,methodIndex},A,b,tau,x);
+    rows = addvars(rows,repmat(method(methodIndex),height(rows),1), ...
+        repmat(i,height(rows),1),'Before',1, ...
+        'NewVariableNames',{'method','instance'});
+    rows.fReference = repmat(fReference,height(rows),1);
+    rows.referenceResidual = repmat(referenceResidual,height(rows),1);
     metricTable = [metricTable;rows]; %#ok<AGROW>
 end
-outputFolder = fullfile(thisDir,'output');
-if ~exist(outputFolder,'dir'); mkdir(outputFolder); end
-writetable(metricTable,fullfile(outputFolder, ...
-    sprintf('gaussian-n2^14-rho-%.2f-tol-%.0e-instance-metrics.csv',rho,tol)));
-
-summaryTable = table(method,mean(successfulTimes,1,'omitnan').', ...
-    std(successfulTimes,0,1,'omitnan').',mean(successfulMvp,1,'omitnan').', ...
-    std(successfulMvp,0,1,'omitnan').',mean(outerIterations,1,'omitnan').', ...
-    mean(proxResidual,1,'omitnan').',mean(relativeRecoveryError,1,'omitnan').', ...
-    mean(relativeFunctionGap,1,'omitnan').', ...
-    mean(success,1).', ...
-    'VariableNames',{'method','meanTime','stdTime','meanRawMVP','stdRawMVP', ...
-    'meanOuterIterations','meanProxResidual','meanRelativeRecoveryError', ...
-    'meanRelativeFunctionGap', ...
-    'successRate'});
-disp(summaryTable);
-writetable(summaryTable,fullfile(outputFolder, ...
-    sprintf('gaussian-n2^14-rho-%.2f-tol-%.0e-summary.csv',rho,tol)));
-
-function [residual,recoveryError,functionGap] = lassoInstanceMetrics(w,A,b,tau,xTrue,fReference)
-% Use the same unit-step proximal residual for every solver.
-if isempty(w) || any(~isfinite(w))
-    residual = Inf;
-    recoveryError = Inf;
-    functionGap = Inf;
-    return;
+fprintf('Instance %d/%d complete; all gaps extracted from the same runs.\n', ...
+    i,numInstances);
+% Persist completed trajectories and first-crossing snapshots after each
+% instance; data generation and reference solves are not repeated per target.
+save(fullfile(outputFolder,[outputStem,'-trajectories.mat']), ...
+    'runHistory','references','metricTable','tolerances','method','rho', ...
+    'N','M','numInstances','maxOuterIter','fastMemory','stopCriterion');
 end
-gradient = A'*(A*w-b);
-proxPoint = sign(w-gradient).*max(abs(w-gradient)-tau,0);
-residual = norm(w-proxPoint);
-recoveryError = norm(w-xTrue)/max(norm(xTrue),eps);
-functionValue = lassoObjective(w,A,b,tau);
-functionGap = (functionValue-fReference)/max(1,abs(fReference));
+
+summaryTable = summarizeCheckpoints(metricTable,method,tolerances);
+disp(summaryTable);
+for q = 1:numel(tolerances)
+    target = tolerances(q);
+    targetMetrics = metricTable(metricTable.tol == target,:);
+    targetSummary = summaryTable(summaryTable.tol == target,:);
+    writetable(targetMetrics,fullfile(outputFolder, ...
+        sprintf('%s-tol-%.0e-instance-metrics.csv',outputStem,target)));
+    writetable(targetSummary,fullfile(outputFolder, ...
+        sprintf('%s-tol-%.0e-summary.csv',outputStem,target)));
+    plotCheckpointTimes(targetMetrics,method,numInstances,target);
+end
+
+function summary = summarizeCheckpoints(metrics,method,tolerances)
+summary = table();
+for q = 1:numel(tolerances)
+    for j = 1:numel(method)
+        d = metrics(metrics.tol == tolerances(q) & strcmp(metrics.method,method{j}),:);
+        row = table(tolerances(q),method(j), ...
+            mean(d.cpuTime,'omitnan'),std(d.cpuTime,0,'omitnan'), ...
+            mean(d.rawMVP,'omitnan'),std(d.rawMVP,0,'omitnan'), ...
+            mean(d.outerIterations,'omitnan'),mean(d.proxResidual,'omitnan'), ...
+            mean(d.relativeRecoveryError,'omitnan'), ...
+            mean(d.relativeFunctionGap,'omitnan'),mean(d.success), ...
+            'VariableNames',{'tol','method','meanTime','stdTime','meanRawMVP', ...
+            'stdRawMVP','meanOuterIterations','meanProxResidual', ...
+            'meanRelativeRecoveryError','meanRelativeFunctionGap','successRate'});
+        summary = [summary;row]; %#ok<AGROW>
+    end
+end
+end
+
+function plotCheckpointTimes(metrics,method,numInstances,target)
+times = NaN(numInstances,numel(method));
+for j = 1:numel(method)
+    d = metrics(strcmp(metrics.method,method{j}),:);
+    times(d.instance,j) = d.cpuTime;
+end
+validGroups = any(isfinite(times),1);
+if ~any(validGroups); return; end
+figure;
+if numInstances >= 2
+    boxplot(times(:,validGroups),'Labels',method(validGroups).');
+else
+    plot(times,'o');
+    set(gca,'XTick',1:numel(method),'XTickLabel',method);
+end
+ylabel('Elapsed time (s)');
+title(sprintf('First relative gap <= %.0e',target));
+grid on;
 end
 
 function value = lassoObjective(w,A,b,tau)

@@ -39,6 +39,7 @@ M = opts.M;
 tol = opts.tol;
 if ~isfield(opts,'stopCriterion'); opts.stopCriterion = 'proxResidual'; end
 if ~isfield(opts,'fReference'); opts.fReference = []; end
+if ~isfield(opts,'recordFcn'); opts.recordFcn = []; end
 stopCriterion = resolveStopCriterion(opts.stopCriterion);
 if strcmp(stopCriterion,'relativeFunctionGap') && ...
         (isempty(opts.fReference) || ~isscalar(opts.fReference) || ~isfinite(opts.fReference))
@@ -71,6 +72,9 @@ resi_array(1) = resi;
 F_cache = -inf(M,1);
 F_cache(1) = funv_array(1);
 Fmax = max(F_cache);
+if ~isempty(opts.recordFcn)
+    opts.recordFcn(x,funv_array(1),toc(tstart),mvp,0);
+end
 
 while k<maxit
 
@@ -129,6 +133,9 @@ while k<maxit
     resi_array(k+1) = resi;
     F_cache(mod(k+1,M)+1,1) = F_new;
     Fmax = max(F_cache);
+    if ~isempty(opts.recordFcn)
+        opts.recordFcn(x,F_new,toc(tstart),mvp,k);
+    end
     
 end
 
@@ -159,6 +166,5 @@ end
 function ss = shringkage(xx,mumu)
         ss = sign(xx).*max(abs(xx)-mumu,0);
 end
-
 
 

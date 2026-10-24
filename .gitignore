@@ -1,0 +1,9 @@
+# MATLAB backups and native build intermediates
+*.asv
+*.o
+*.mod
+.DS_Store
+
+# Local datasets
+**/dataset/
+**/datasets/
