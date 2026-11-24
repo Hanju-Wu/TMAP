@@ -99,7 +99,7 @@ references{i} = struct('fReference',fReference,'residual',referenceResidual, ...
 
 %% PSSgb-LBFGS
 lambda = 2*tau*ones(N,1); % Penalize the absolute value of each element by the same amount
-funObj = @(w)SquaredError(w,A,b); % Loss function that L1 regularization is applied to
+funObj = @(w)SquaredError(sparse(w),A,b); % Use sparse trial vectors in forward products.
 w_init = x0; % Initial value for iterative optimizer
 options = struct();
 options.lossType = 'lasso';

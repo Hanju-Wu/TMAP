@@ -3,12 +3,17 @@ function build_mex
 root = setup_paths;
 lr = fullfile(root,'logistic regression');
 mf = fullfile(root,'lasso','L1GeneralExamples','minFunc_2012');
+compiled = fullfile(mf,'compiled');
+if ~isfolder(compiled)
+    mkdir(compiled);
+end
 mex('-largeArrayDims',fullfile(lr,'libsvmread.c'),'-outdir',lr);
 mex('-largeArrayDims',fullfile(lr,'IRPN','ripn_cordmin.c'), ...
     '-outdir',fullfile(lr,'IRPN'));
 % The upstream lbfgsC gateway declares its dimension array as int.
 mex('-compatibleArrayDims',fullfile(mf,'mex','lbfgsC.c'), ...
-    '-outdir',fullfile(mf,'compiled'));
+    '-outdir',compiled);
+addpath(compiled);
 rehash;
 fprintf('Built libsvmread, ripn_cordmin and lbfgsC for %s.\n',mexext);
 end

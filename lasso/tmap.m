@@ -501,6 +501,10 @@ out.Acalls = out.mvp_total;
             Swork(:,j) = S{valid(j)}(mask);
             Ywork(:,j) = Y{valid(j)}(mask);
         end
+        % Scale the initial inverse Hessian using the latest pair on this working set.
+        sWork = Swork(:,end);
+        yWork = Ywork(:,end);
+        Hdiag = (sWork'*yWork)/(yWork'*yWork);
         if useCompiledLBFGS
             d = lbfgsC(g,Swork,Ywork,Hdiag);
         else

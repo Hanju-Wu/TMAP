@@ -6,6 +6,9 @@ ls = fullfile(root,'lasso');
 vendor = fullfile(ls,'L1GeneralExamples');
 addpath(root,lr,fullfile(lr,'IRPN'),ls,fullfile(ls,'FAST-BCDA'), ...
     fullfile(vendor,'L1General2_2010'),fullfile(vendor,'lossFuncs'), ...
-    fullfile(vendor,'misc'),fullfile(vendor,'minFunc_2012'), ...
-    fullfile(vendor,'minFunc_2012','compiled'));
+    fullfile(vendor,'misc'),fullfile(vendor,'minFunc_2012'));
+compiled = fullfile(vendor,'minFunc_2012','compiled');
+if isfolder(compiled)
+    addpath(compiled);
+end
 end

@@ -2,8 +2,13 @@
 *.asv
 *.o
 *.mod
+*.mex*
 .DS_Store
 
 # Local datasets
 **/dataset/
 **/datasets/
+
+# Experiment outputs
+/lasso/output/
+/logistic regression/output/
